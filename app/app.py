@@ -1,12 +1,19 @@
-import os
-import numpy as np
-import tensorflow as tf
+
+import sys
+import tempfile
+from pathlib import Path
+
 import streamlit as st
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+
+from PIL import Image
+from torchvision import transforms
+from torchvision.models import efficientnet_b0
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# 1. PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -17,211 +24,154 @@ st.set_page_config(
 
 
 # ============================================================
-# MODEL PATHS
+# 2. PROJECT PATHS AND ARCFACE IMPORT
 # ============================================================
 
-DEEPFAKE_MODEL_PATH = "models/deepfake_efficientnet_final.keras"
-SIAMESE_MODEL_PATH = "models/siamese_efficientnet.keras"
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+
+DEEPFAKE_MODEL_PATH = (
+    PROJECT_DIR / "models" / "efficientnet_b0_deepfake_best.pth"
+)
+
+# Allow Python to import arcface_verification.py from the
+# project root, even though this app is inside the app folder.
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from arcface_verification import (
+    verify_faces,
+    SIMILARITY_THRESHOLD
+)
 
 
-# ============================================================
-# VERIFICATION THRESHOLD
-# ============================================================
-#
-# Smaller distance = more similar faces.
-#
-# Your previous test produced:
-# Face distance = 0.3176
-#
-# Therefore:
-# 0.3176 <= 0.35
-#
-# Result = SAME PERSON
-#
-# This threshold is for the project demonstration and
-# calibration. It does not increase the trained model's
-# actual test accuracy.
-# ============================================================
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
-VERIFICATION_THRESHOLD = 0.35
+IMAGE_SIZE = 224
 
-
-# ============================================================
-# CUSTOM LAYER: L2 NORMALIZATION
-# ============================================================
-
-@tf.keras.utils.register_keras_serializable()
-class L2Normalization(layers.Layer):
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def call(self, inputs):
-        return tf.math.l2_normalize(
-            inputs,
-            axis=1
-        )
-
-    def get_config(self):
-        return super().get_config()
+CLASS_NAMES = ["Fake", "Real"]
 
 
 # ============================================================
-# CUSTOM LAYER: EUCLIDEAN DISTANCE
-# ============================================================
-
-@tf.keras.utils.register_keras_serializable()
-class EuclideanDistance(layers.Layer):
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def call(self, inputs):
-
-        embedding1, embedding2 = inputs
-
-        difference = embedding1 - embedding2
-
-        squared_difference = tf.square(
-            difference
-        )
-
-        summed = tf.reduce_sum(
-            squared_difference,
-            axis=1,
-            keepdims=True
-        )
-
-        distance = tf.sqrt(
-            summed + 1e-10
-        )
-
-        return distance
-
-    def get_config(self):
-        return super().get_config()
-
-
-# ============================================================
-# CONTRASTIVE LOSS
-# ============================================================
-
-@tf.keras.utils.register_keras_serializable()
-def contrastive_loss(y_true, y_pred):
-
-    margin = 1.0
-
-    y_true = tf.cast(
-        y_true,
-        tf.float32
-    )
-
-    y_true = tf.reshape(
-        y_true,
-        (-1, 1)
-    )
-
-    positive_loss = (
-        y_true *
-        tf.square(y_pred)
-    )
-
-    negative_loss = (
-        (1.0 - y_true) *
-        tf.square(
-            tf.maximum(
-                margin - y_pred,
-                0.0
-            )
-        )
-    )
-
-    return tf.reduce_mean(
-        positive_loss + negative_loss
-    )
-
-
-# ============================================================
-# LOAD DEEPFAKE MODEL
+# 3. LOAD PYTORCH DEEPFAKE MODEL
 # ============================================================
 
 @st.cache_resource
 def load_deepfake_model():
+    """Load the trained EfficientNet-B0 deepfake checkpoint."""
 
-    return tf.keras.models.load_model(
-        DEEPFAKE_MODEL_PATH
+    if not DEEPFAKE_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Deepfake checkpoint not found: "
+            f"{DEEPFAKE_MODEL_PATH}"
+        )
+
+    checkpoint = torch.load(
+        DEEPFAKE_MODEL_PATH,
+        map_location=DEVICE,
+        weights_only=True
     )
+
+    if checkpoint.get("architecture") != "efficientnet_b0":
+        raise ValueError(
+            "The checkpoint architecture is not EfficientNet-B0."
+        )
+
+    class_to_idx = checkpoint.get("class_to_idx")
+
+    if class_to_idx != {"Fake": 0, "Real": 1}:
+        raise ValueError(
+            f"Unexpected class mapping in checkpoint: {class_to_idx}"
+        )
+
+    model = efficientnet_b0(weights=None)
+
+    input_features = model.classifier[1].in_features
+
+    model.classifier[1] = nn.Linear(
+        input_features,
+        2
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
+    model = model.to(DEVICE)
+    model.eval()
+
+    return model
 
 
 # ============================================================
-# LOAD SIAMESE MODEL
+# 4. DEEPFAKE IMAGE PREPROCESSING
 # ============================================================
 
-@st.cache_resource
-def load_siamese_model():
-
-    return tf.keras.models.load_model(
-        SIAMESE_MODEL_PATH,
-        custom_objects={
-            "L2Normalization": L2Normalization,
-            "EuclideanDistance": EuclideanDistance,
-            "contrastive_loss": contrastive_loss
-        },
-        safe_mode=False
+deepfake_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
     )
+])
 
 
-# ============================================================
-# IMAGE PREPARATION
-# ============================================================
+def prepare_deepfake_image(uploaded_file):
+    """
+    Apply the same image transformation used by the
+    existing EfficientNet-B0 inference pipeline.
+    """
 
-def prepare_image(uploaded_file):
+    image = Image.open(uploaded_file).convert("RGB")
 
-    image_bytes = uploaded_file.getvalue()
+    image_tensor = deepfake_transform(image)
 
-    image = tf.image.decode_image(
-        image_bytes,
-        channels=3,
-        expand_animations=False
-    )
+    # Shape: [1, 3, 224, 224]
+    image_tensor = image_tensor.unsqueeze(0)
 
-    image.set_shape(
-        [None, None, 3]
-    )
-
-    image = tf.image.resize(
-        image,
-        (224, 224)
-    )
-
-    image = tf.cast(
-        image,
-        tf.float32
-    )
-
-    image = tf.expand_dims(
-        image,
-        axis=0
-    )
-
-    return image
+    return image_tensor.to(DEVICE)
 
 
 # ============================================================
-# CHECK MODELS
+# 5. DEEPFAKE PREDICTION
 # ============================================================
 
-deepfake_exists = os.path.exists(
-    DEEPFAKE_MODEL_PATH
-)
+def predict_deepfake(model, uploaded_file):
+    """Return the predicted class and softmax class scores."""
 
-siamese_exists = os.path.exists(
-    SIAMESE_MODEL_PATH
-)
+    image_tensor = prepare_deepfake_image(uploaded_file)
+
+    with torch.inference_mode():
+        logits = model(image_tensor)
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1
+        )[0]
+
+    fake_score = float(probabilities[0].item())
+    real_score = float(probabilities[1].item())
+
+    predicted_index = int(
+        torch.argmax(probabilities).item()
+    )
+
+    prediction = CLASS_NAMES[predicted_index]
+
+    return prediction, fake_score, real_score
 
 
 # ============================================================
-# TITLE
+# 6. MODEL STATUS
+# ============================================================
+
+deepfake_exists = DEEPFAKE_MODEL_PATH.exists()
+
+
+# ============================================================
+# 7. APPLICATION TITLE
 # ============================================================
 
 st.title(
@@ -229,90 +179,73 @@ st.title(
 )
 
 st.write(
-    "EfficientNet-B0 based academic project"
+    "An academic project combining image-based deepfake "
+    "classification with ArcFace-based cross-age face verification."
+)
+
+st.caption(
+    f"Deepfake model device: {DEVICE}"
 )
 
 st.divider()
 
 
 # ============================================================
-# MODEL STATUS
+# 8. MODEL STATUS DISPLAY
 # ============================================================
 
 col1, col2 = st.columns(2)
 
 with col1:
-
     if deepfake_exists:
-
-        st.success(
-            "✓ Deepfake model ready"
-        )
-
+        st.success("✓ EfficientNet-B0 Deepfake Model Ready")
     else:
-
-        st.error(
-            "✗ Deepfake model not found"
-        )
-
+        st.error("✗ Deepfake checkpoint not found")
 
 with col2:
+    st.success("✓ ArcFace Verification Module Configured")
 
-    if siamese_exists:
-
-        st.success(
-            "✓ Siamese model ready"
-        )
-
-    else:
-
-        st.error(
-            "✗ Siamese model not found"
-        )
-
-
-# ============================================================
-# TABS
-# ============================================================
-
-tab1, tab2 = st.tabs(
-    [
-        "🎭 Deepfake Detection",
-        "👥 Cross-Age Verification"
-    ]
+st.caption(
+    "ArcFace is initialized when the verification module is imported. "
+    "The first face comparison may take longer while models initialize."
 )
 
 
 # ============================================================
-# DEEPFAKE DETECTION
+# 9. APPLICATION TABS
+# ============================================================
+
+tab1, tab2 = st.tabs([
+    "🎭 Deepfake Detection",
+    "👥 Cross-Age Verification"
+])
+
+
+# ============================================================
+# 10. DEEPFAKE DETECTION TAB
 # ============================================================
 
 with tab1:
 
-    st.header(
-        "Deepfake Face Detection"
-    )
+    st.header("Deepfake Face Detection")
 
     st.write(
-        "Upload a face image to classify it as Real or Fake."
+        "Upload a face image to obtain the model's "
+        "Fake or Real classification."
     )
 
     uploaded_image = st.file_uploader(
         "Choose an image",
-        type=[
-            "jpg",
-            "jpeg",
-            "png"
-        ],
+        type=["jpg", "jpeg", "png"],
         key="deepfake_upload"
     )
 
     if uploaded_image is not None:
 
         st.image(
-            uploaded_image,
-            caption="Uploaded Image",
-            width="stretch"
+            uploaded_image.getvalue(),
+            caption="Uploaded image",
+            use_container_width=True
         )
 
         if st.button(
@@ -322,248 +255,220 @@ with tab1:
         ):
 
             if not deepfake_exists:
-
                 st.error(
-                    "Deepfake model file is missing."
+                    "Deepfake checkpoint is missing. "
+                    "Check the models folder."
                 )
 
             else:
+                try:
+                    with st.spinner("Analyzing image..."):
 
-                with st.spinner(
-                    "Analyzing image..."
-                ):
+                        # Reset the file position before reading.
+                        uploaded_image.seek(0)
 
-                    model = load_deepfake_model()
+                        model = load_deepfake_model()
 
-                    image = prepare_image(
-                        uploaded_image
-                    )
+                        prediction, fake_score, real_score = (
+                            predict_deepfake(
+                                model,
+                                uploaded_image
+                            )
+                        )
 
-                    probability = model.predict(
-                        image,
-                        verbose=0
-                    )[0][0]
-
-                    probability = float(
-                        probability
-                    )
-
-                # fake = 0
-                # real = 1
-
-                if probability >= 0.5:
-
-                    prediction = "REAL"
-
-                    confidence = (
-                        probability * 100
-                    )
-
-                else:
-
-                    prediction = "FAKE"
-
-                    confidence = (
-                        (1.0 - probability) * 100
-                    )
-
-                if prediction == "REAL":
-
-                    st.success(
+                    st.subheader(
                         f"Prediction: {prediction}"
                     )
 
-                else:
+                    if prediction.upper() == "FAKE":
+                        st.error(
+                            "The model classified this image as FAKE."
+                        )
+                    else:
+                        st.success(
+                            "The model classified this image as REAL."
+                        )
 
-                    st.error(
-                        f"Prediction: {prediction}"
+                    col_fake, col_real = st.columns(2)
+
+                    with col_fake:
+                        st.metric(
+                            "Fake class score",
+                            f"{fake_score * 100:.2f}%"
+                        )
+
+                    with col_real:
+                        st.metric(
+                            "Real class score",
+                            f"{real_score * 100:.2f}%"
+                        )
+
+                    st.caption(
+                        "These percentages are softmax class scores, "
+                        "not calibrated probabilities or guarantees "
+                        "that the image is genuine or manipulated."
                     )
 
-                st.metric(
-                    "Confidence",
-                    f"{confidence:.2f}%"
-                )
-
-                st.progress(
-                    min(
-                        max(
-                            confidence / 100,
-                            0.0
-                        ),
-                        1.0
+                    st.progress(
+                        max(0.0, min(1.0, fake_score)),
+                        text="Fake class score"
                     )
-                )
+
+                except Exception as error:
+                    st.error("Could not run deepfake detection.")
+                    st.exception(error)
 
 
 # ============================================================
-# CROSS-AGE VERIFICATION
+# 11. CROSS-AGE FACE VERIFICATION TAB — ARCFACE
 # ============================================================
 
 with tab2:
 
-    st.header(
-        "Cross-Age Face Verification"
-    )
+    st.header("Cross-Age Face Verification")
 
     st.write(
-        "Upload two face images to determine whether "
-        "they are likely to belong to the same person."
+        "Upload two face images to estimate whether they "
+        "may belong to the same person, even across different ages."
     )
 
     st.info(
-        "Verification threshold: "
-        f"{VERIFICATION_THRESHOLD:.2f} "
-        "(smaller distance means more similar faces)"
+        f"Cosine similarity threshold: {SIMILARITY_THRESHOLD:.6f}\n\n"
+        "A similarity equal to or above this threshold is classified "
+        "as Same person. A lower score is classified as Different people."
     )
 
     col1, col2 = st.columns(2)
 
     with col1:
-
         image1_file = st.file_uploader(
-            "First face image",
-            type=[
-                "jpg",
-                "jpeg",
-                "png"
-            ],
-            key="face1"
+            "Upload first face image",
+            type=["jpg", "jpeg", "png"],
+            key="arcface_face1"
         )
 
     with col2:
-
         image2_file = st.file_uploader(
-            "Second face image",
-            type=[
-                "jpg",
-                "jpeg",
-                "png"
-            ],
-            key="face2"
+            "Upload second face image",
+            type=["jpg", "jpeg", "png"],
+            key="arcface_face2"
         )
 
     if image1_file is not None:
-
         st.image(
-            image1_file,
-            caption="Face 1",
-            width="stretch"
+            image1_file.getvalue(),
+            caption="First face image",
+            use_container_width=True
         )
 
     if image2_file is not None:
-
         st.image(
-            image2_file,
-            caption="Face 2",
-            width="stretch"
+            image2_file.getvalue(),
+            caption="Second face image",
+            use_container_width=True
         )
 
-    if (
-        image1_file is not None
-        and
-        image2_file is not None
-    ):
+    if image1_file is not None and image2_file is not None:
 
         if st.button(
-            "Verify Identity",
+            "Verify Faces with ArcFace",
             type="primary",
-            key="verify_identity"
+            key="arcface_verify"
         ):
 
-            if not siamese_exists:
-
-                st.error(
-                    "Siamese model file is missing."
-                )
-
-            else:
-
+            try:
                 with st.spinner(
-                    "Comparing faces..."
+                    "Detecting faces and comparing embeddings..."
                 ):
 
-                    model = load_siamese_model()
+                    # InsightFace's existing verification function
+                    # accepts file paths, so save uploads temporarily.
+                    with tempfile.TemporaryDirectory() as temp_dir:
 
-                    image1 = prepare_image(
-                        image1_file
-                    )
+                        image1_path = Path(temp_dir) / "face1.jpg"
+                        image2_path = Path(temp_dir) / "face2.jpg"
 
-                    image2 = prepare_image(
-                        image2_file
-                    )
-
-                    try:
-
-                        distance = model.predict(
-                            {
-                                "image1": image1,
-                                "image2": image2
-                            },
-                            verbose=0
+                        image1_path.write_bytes(
+                            image1_file.getvalue()
                         )
 
-                    except Exception:
-
-                        distance = model.predict(
-                            [
-                                image1,
-                                image2
-                            ],
-                            verbose=0
+                        image2_path.write_bytes(
+                            image2_file.getvalue()
                         )
 
-                    distance = float(
-                        np.asarray(
-                            distance
-                        ).reshape(-1)[0]
-                    )
+                        result = verify_faces(
+                            image1_path,
+                            image2_path
+                        )
 
-                same_person = (
-                    distance <=
-                    VERIFICATION_THRESHOLD
-                )
+                if not result["success"]:
 
-                st.metric(
-                    "Face Distance",
-                    f"{distance:.4f}"
-                )
+                    st.warning(result["message"])
 
-                st.caption(
-                    "Verification threshold: "
-                    f"{VERIFICATION_THRESHOLD:.2f}"
-                )
-
-                if same_person:
-
-                    st.success(
-                        "✓ SAME PERSON"
-                    )
-
-                    st.write(
-                        "The model considers the two "
-                        "faces similar enough to belong "
-                        "to the same identity."
+                    st.info(
+                        "Try clearer images with a visible, "
+                        "front-facing face."
                     )
 
                 else:
+                    similarity = result["similarity"]
+                    prediction = result["prediction"]
+                    threshold = result["threshold"]
 
-                    st.warning(
-                        "✗ DIFFERENT PERSON"
+                    st.subheader("Verification Result")
+
+                    st.metric(
+                        "Cosine Similarity",
+                        f"{similarity:.4f}"
                     )
 
-                    st.write(
-                        "The model considers the two "
-                        "faces different."
+                    st.caption(
+                        f"Decision threshold: {threshold:.6f}"
                     )
+
+                    # Display the raw cosine similarity on a
+                    # bounded scale; it is not a probability.
+                    display_score = max(
+                        0.0,
+                        min(1.0, similarity)
+                    )
+
+                    st.progress(
+                        display_score,
+                        text="Cosine similarity (display scale)"
+                    )
+
+                    if prediction == "Same person":
+                        st.success(
+                            "✓ SAME PERSON — similarity meets "
+                            "or exceeds the configured threshold."
+                        )
+                    else:
+                        st.warning(
+                            "DIFFERENT PEOPLE — similarity is below "
+                            "the configured threshold."
+                        )
+
+                    st.caption(
+                        "This result is a model estimate, not proof "
+                        "of identity. ArcFace can make mistakes, "
+                        "especially with large age gaps, poor image "
+                        "quality, or multiple faces. The largest "
+                        "detected face is selected automatically."
+                    )
+
+            except Exception as error:
+                st.error("Could not run ArcFace verification.")
+                st.exception(error)
 
 
 # ============================================================
-# FOOTER
+# 12. FOOTER
 # ============================================================
 
 st.divider()
 
 st.caption(
     "Academic Project — EfficientNet-B0 Deepfake Detection "
-    "and Cross-Age Face Verification"
+    "and ArcFace Cross-Age Face Verification"
 )
